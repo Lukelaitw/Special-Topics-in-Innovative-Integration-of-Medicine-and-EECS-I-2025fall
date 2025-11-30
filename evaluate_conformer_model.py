@@ -813,6 +813,15 @@ class ConformerEvaluator:
         # 載入數據
         X_train, y_train, X_val, y_val, X_test, y_test = self.load_all_data()
         
+        # 保存原始測試數據供可視化使用
+        if save_to_file:
+            np.save('./results/test_data.npy', X_test)
+            np.save('./results/test_labels.npy', y_test)
+            np.save('./results/val_data.npy', X_val)
+            np.save('./results/val_labels.npy', y_val)
+            print("原始測試數據和驗證數據已保存到 ./results/")
+            all_text_lines.append("原始測試數據和驗證數據已保存到 ./results/")
+        
         # 創建數據加載器
         val_dataset = EEGDataset(X_val, y_val)
         test_dataset = EEGDataset(X_test, y_test)
