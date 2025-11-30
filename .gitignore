@@ -11,31 +11,15 @@ build/
 # Jupyter Notebook
 .ipynb_checkpoints
 
-# PyTorch
-*.pth
-*.pt
-checkpoints/*.pth
+# Data files (handled by Git LFS, but ignore if not tracked)
+# *.npy  # Now tracked by Git LFS
+# *.pth  # Now tracked by Git LFS
+# *.pt   # Now tracked by Git LFS
 
-# Data files
-*.npy
-*.npz
+# Other data formats
 *.mat
 *.set
 *.fdt
-results/*.npy
-results/val_data.npy
-results/test_data.npy
-results/val_labels.npy
-results/test_labels.npy
-results/val_predictions.npy
-results/test_predictions.npy
-results/val_probabilities.npy
-results/test_probabilities.npy
-results/val_true_labels.npy
-results/test_true_labels.npy
-
-# Large visualization files (optional - uncomment if you want to ignore them)
-# results/visualization/*.png
 
 # Logs
 *.log
