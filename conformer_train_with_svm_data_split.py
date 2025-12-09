@@ -8,6 +8,7 @@
 """
 
 import os
+os.environ['WANDB_API_KEY'] = "YOUR_WANDB_API_KEY"
 import sys
 import numpy as np
 import pandas as pd
