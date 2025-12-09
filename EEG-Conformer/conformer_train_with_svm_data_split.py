@@ -21,6 +21,7 @@ from torch.utils.data import Dataset, DataLoader
 from torch.autograd import Variable
 import warnings
 warnings.filterwarnings('ignore')
+import wandb
 
 # 導入 Conformer 模型
 # 確保可以從當前目錄或父目錄導入
@@ -139,6 +140,27 @@ class ConformerTrainer:
         print(f"深度: {self.depth}")
         print(f"類別數: {self.n_classes}")
         print("="*60)
+        
+        # 初始化 wandb
+        wandb.init(
+            project="EEG-Conformer",
+            name=f"conformer_svm_split_bs{self.batch_size}_lr{self.lr}_emb{self.emb_size}_depth{self.depth}",
+            config={
+                "batch_size": self.batch_size,
+                "n_epochs": self.n_epochs,
+                "lr": self.lr,
+                "emb_size": self.emb_size,
+                "depth": self.depth,
+                "n_classes": self.n_classes,
+                "window_length": self.window_length,
+                "target_sfreq": self.target_sfreq,
+                "n_channels": self.n_channels,
+                "target_timepoints": self.target_timepoints,
+                "gradient_accumulation_steps": self.gradient_accumulation_steps,
+                "effective_batch_size": self.batch_size * self.gradient_accumulation_steps,
+                "resume_from": self.resume_from,
+            }
+        )
     
     def load_eeg_data_from_subject(self, subject_id):
         """
@@ -374,6 +396,28 @@ class ConformerTrainer:
         print(f"驗證集類別分布: {dict(zip(self.le.classes_, np.bincount(y_val)))}")
         print(f"測試集類別分布: {dict(zip(self.le.classes_, np.bincount(y_test)))}")
         print("="*60)
+        
+        # 記錄數據集統計信息到 wandb
+        wandb.log({
+            "dataset/total_samples": len(X),
+            "dataset/train_samples": len(X_train),
+            "dataset/val_samples": len(X_val),
+            "dataset/test_samples": len(X_test),
+            "dataset/train_ratio": len(X_train)/len(X),
+            "dataset/val_ratio": len(X_val)/len(X),
+            "dataset/test_ratio": len(X_test)/len(X),
+        })
+        
+        # 記錄每個類別的樣本數
+        train_class_dist = dict(zip(self.le.classes_, np.bincount(y_train)))
+        val_class_dist = dict(zip(self.le.classes_, np.bincount(y_val)))
+        test_class_dist = dict(zip(self.le.classes_, np.bincount(y_test)))
+        for class_name in self.le.classes_:
+            wandb.log({
+                f"dataset/train_{class_name}": train_class_dist.get(class_name, 0),
+                f"dataset/val_{class_name}": val_class_dist.get(class_name, 0),
+                f"dataset/test_{class_name}": test_class_dist.get(class_name, 0),
+            })
         
         # 轉換為 Conformer 需要的格式: (trials, 1, channels, timepoints)
         X_train = np.expand_dims(X_train, axis=1)
@@ -803,9 +847,47 @@ class ConformerTrainer:
                     torch.cuda.empty_cache()
                 
                 self.model.eval()
-                all_preds = []
-                all_labels = []
-                total_loss = 0.0
+                
+                # 先驗證驗證集
+                val_all_preds = []
+                val_all_labels = []
+                val_total_loss = 0.0
+                
+                with torch.no_grad():
+                    # 分批處理驗證集
+                    for val_batch_idx, (val_img, val_label_batch) in enumerate(val_loader):
+                        val_img = Variable(val_img.to(self.device).type(self.Tensor))
+                        val_label_batch = Variable(val_label_batch.to(self.device).type(self.LongTensor))
+                        
+                        Tok, Cls = self.model(val_img)
+                        loss_val = self.criterion_cls(Cls, val_label_batch)
+                        y_pred_batch = torch.max(Cls, 1)[1]
+                        
+                        # 累積預測和標籤
+                        val_all_preds.append(y_pred_batch.detach().cpu())
+                        val_all_labels.append(val_label_batch.detach().cpu())
+                        val_total_loss += loss_val.item()
+                        
+                        # 立即釋放當前批次的變數
+                        del Tok, Cls, loss_val, val_img, val_label_batch, y_pred_batch
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                
+                # 合併驗證集所有批次的結果
+                val_all_preds = torch.cat(val_all_preds)
+                val_all_labels = torch.cat(val_all_labels)
+                val_acc = float((val_all_preds == val_all_labels).numpy().astype(int).sum()) / float(val_all_labels.size(0))
+                val_avg_loss = val_total_loss / len(val_loader)
+                
+                # 清理驗證集臨時變數
+                del val_all_preds, val_all_labels
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                
+                # 然後驗證測試集
+                test_all_preds = []
+                test_all_labels = []
+                test_total_loss = 0.0
                 
                 with torch.no_grad():
                     # 分批處理測試集，避免一次性載入整個測試集到 GPU
@@ -818,27 +900,27 @@ class ConformerTrainer:
                         y_pred_batch = torch.max(Cls, 1)[1]
                         
                         # 累積預測和標籤
-                        all_preds.append(y_pred_batch.detach().cpu())
-                        all_labels.append(test_label_batch.detach().cpu())
-                        total_loss += loss_test.item()
+                        test_all_preds.append(y_pred_batch.detach().cpu())
+                        test_all_labels.append(test_label_batch.detach().cpu())
+                        test_total_loss += loss_test.item()
                         
                         # 立即釋放當前批次的變數
                         del Tok, Cls, loss_test, test_img, test_label_batch, y_pred_batch
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
                 
-                # 合併所有批次的結果
-                all_preds = torch.cat(all_preds)
-                all_labels = torch.cat(all_labels)
-                acc = float((all_preds == all_labels).numpy().astype(int).sum()) / float(all_labels.size(0))
-                avg_loss = total_loss / len(test_loader)
+                # 合併測試集所有批次的結果
+                test_all_preds = torch.cat(test_all_preds)
+                test_all_labels = torch.cat(test_all_labels)
+                acc = float((test_all_preds == test_all_labels).numpy().astype(int).sum()) / float(test_all_labels.size(0))
+                test_avg_loss = test_total_loss / len(test_loader)
                 
                 # 保存 y_pred 和 test_labels 用於後續處理（如果需要）
-                y_pred = all_preds.clone()  # 創建副本
-                test_labels_for_save = all_labels.clone()  # 保存測試標籤
+                y_pred = test_all_preds.clone()  # 創建副本
+                test_labels_for_save = test_all_labels.clone()  # 保存測試標籤
                 
-                # 清理臨時變數
-                del all_preds, all_labels
+                # 清理測試集臨時變數
+                del test_all_preds, test_all_labels
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 
@@ -865,10 +947,22 @@ class ConformerTrainer:
                             torch.cuda.empty_cache()
                 
                 epoch_time = time.time() - epoch_start_time
-                print(f'Epoch: {epoch+1}, Train loss: {train_loss:.6f}, Train acc: {train_acc:.6f}, Test acc: {acc:.6f}, 耗時: {epoch_time:.2f}秒', flush=True)
+                print(f'Epoch: {epoch+1}, Train loss: {train_loss:.6f}, Train acc: {train_acc:.6f}, Val loss: {val_avg_loss:.6f}, Val acc: {val_acc:.6f}, Test loss: {test_avg_loss:.6f}, Test acc: {acc:.6f}, 耗時: {epoch_time:.2f}秒', flush=True)
                 
                 log_file.write(f"{epoch}    {acc}\n")
                 log_file.flush()
+                
+                # 記錄指標到 wandb
+                wandb.log({
+                    "epoch": epoch + 1,
+                    "train/loss": train_loss,
+                    "train/acc": train_acc,
+                    "val/loss": val_avg_loss,
+                    "val/acc": val_acc,
+                    "test/loss": test_avg_loss,
+                    "test/acc": acc,
+                    "epoch_time": epoch_time,
+                })
                 
                 num += 1
                 aver_acc += acc
@@ -885,6 +979,12 @@ class ConformerTrainer:
                     else:
                         torch.save(self.model.state_dict(), 
                                  os.path.join(self.checkpoint_dir, 'best_model.pth'))
+                    
+                    # 記錄最佳模型指標到 wandb
+                    wandb.log({
+                        "best_test_acc": best_acc,
+                        "best_epoch": epoch + 1,
+                    })
                     
                     # 清理記憶體
                     if torch.cuda.is_available():
@@ -920,6 +1020,58 @@ class ConformerTrainer:
         log_file.write(f'The best accuracy is: {best_acc}\n')
         log_file.write(f'The average accuracy is: {aver_acc}\n')
         log_file.close()
+        
+        # 記錄最終結果到 wandb
+        wandb.log({
+            "final/best_acc": best_acc,
+            "final/aver_acc": aver_acc,
+        })
+        
+        # 如果有混淆矩陣，也可以記錄
+        if Y_true is not None and Y_pred is not None:
+            from sklearn.metrics import confusion_matrix, classification_report
+            
+            # 確保轉換為 numpy 數組
+            if isinstance(Y_true, torch.Tensor):
+                y_true_np = Y_true.cpu().numpy()
+            else:
+                y_true_np = np.array(Y_true)
+            
+            if isinstance(Y_pred, torch.Tensor):
+                y_pred_np = Y_pred.cpu().numpy()
+            else:
+                y_pred_np = np.array(Y_pred)
+            
+            # 記錄混淆矩陣
+            wandb.log({
+                "confusion_matrix": wandb.plot.confusion_matrix(
+                    probs=None,
+                    y_true=y_true_np,
+                    preds=y_pred_np,
+                    class_names=[str(cls) for cls in self.le.classes_]
+                )
+            })
+            
+            # 記錄分類報告
+            report = classification_report(y_true_np, y_pred_np, 
+                                         target_names=[str(cls) for cls in self.le.classes_],
+                                         output_dict=True)
+            for class_name in self.le.classes_:
+                if str(class_name) in report:
+                    wandb.log({
+                        f"test/{class_name}_precision": report[str(class_name)]['precision'],
+                        f"test/{class_name}_recall": report[str(class_name)]['recall'],
+                        f"test/{class_name}_f1": report[str(class_name)]['f1-score'],
+                    })
+            wandb.log({
+                "test/overall_accuracy": report['accuracy'],
+                "test/macro_avg_precision": report['macro avg']['precision'],
+                "test/macro_avg_recall": report['macro avg']['recall'],
+                "test/macro_avg_f1": report['macro avg']['f1-score'],
+            })
+        
+        # 結束 wandb run
+        wandb.finish()
         
         # 保存最終模型和檢查點
         if hasattr(self.model, 'module'):
